@@ -46,14 +46,35 @@ def _is_dst3_a001c001_verify_tmp(file_path) -> bool:
     return p.name == "A001C001_XXXX_XXXX.mov.copy_in_progress" and "dst_3" in p.parts and "A001XXXX" in p.parts
 
 
-def test_get_hash(tmpdir):
+_HASH_VECTORS_EMPTY = {
+    "md5": "d41d8cd98f00b204e9800998ecf8427e",
+    "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+    "xxh32": "02cc5d05",
+    "xxh64": "ef46db3751d8e999",
+    "xxh3": "2d06800538d394c2",
+    "xxh128": "99aa06d3014798d86001c324468d497f",
+    "c4": "c459dsjfscH38cYeXXYogktxf4Cd9ibshE3BHUo6a58hBXmRQdZrAkZzsWcbWtDg5oQstpDuni4Hirj75GEmTc1sFT",
+}
+_HASH_VECTORS_16MB_OF_X = {
+    "md5": "3cafcbe66fcaf4f8d5174a763b7cf974",
+    "sha1": "94d3e62de071d61513dea8135995dcce57213b35",
+    "xxh32": "649ffba7",
+    "xxh64": "75ba28003b6bfc18",
+    "xxh3": "761e87524f56c22d",
+    "xxh128": "f12a2d9fe5ea3de9761e87524f56c22d",
+    "c4": "c45z2pJEDXuECUXBNruZU7q4vDERZsGa2Gx7VHxQYZjqt2dEiF1FkxUxxJpqJkNZZLFQMnkUkrAVjhCR9JrGSupE1G",
+}
+
+
+@pytest.mark.parametrize("algorithm", list(_HASH_VECTORS_EMPTY))
+def test_get_hash(tmpdir, algorithm):
     p = Path(tmpdir) / "test-äöüàéè.txt"
 
     p.write_text("")
-    assert get_hash(p) == "ef46db3751d8e999"
+    assert get_hash(p, algorithm=algorithm) == _HASH_VECTORS_EMPTY[algorithm]
 
     p.write_text("X" * 1024 * 1024 * 16)
-    assert get_hash(p) == "75ba28003b6bfc18"
+    assert get_hash(p, algorithm=algorithm) == _HASH_VECTORS_16MB_OF_X[algorithm]
 
 
 def test_folder_size(tmpdir):
@@ -66,7 +87,19 @@ def test_folder_size(tmpdir):
     assert folder_size(tmpdir) == 48
 
 
-def test_copy(tmpdir):
+_COPY_VECTORS_16MB_OF_X_LOWER = {
+    "md5": "d4760a6c6500b8c7fbb09e4c65bc558a",
+    "sha1": "f78e872d42c1a6c50c12b410b1bd2b79fbf14653",
+    "xxh32": "9044eda0",
+    "xxh64": "6878668a929c42c1",
+    "xxh3": "cd8aadbe2f17be1d",
+    "xxh128": "fd5e5fbd82c7d930cd8aadbe2f17be1d",
+    "c4": "c44VXhZazyVfyY282ejaDJAUoPnd8GYrcDCzYrjvKixrsRTQHaMbcBUtqdM22hYnWUtcf6UbjcKcVoy96CnGTom4XD",
+}
+
+
+@pytest.mark.parametrize("algorithm", list(_COPY_VECTORS_16MB_OF_X_LOWER))
+def test_copy(tmpdir, algorithm):
     src_file = tmpdir / "test-äöüàéè.txt"
     file_size = 1024 * 1024 * 16
     src_file.write("x" * file_size)
@@ -77,7 +110,7 @@ def test_copy(tmpdir):
 
     destinations = [tmpdir / d / "test" for d in destinations]
 
-    assert copy(src_file, destinations) == "6878668a929c42c1"
+    assert copy(src_file, destinations, algorithm=algorithm) == _COPY_VECTORS_16MB_OF_X_LOWER[algorithm]
     assert folder_size(tmpdir) == file_size * 4
 
     for d in destinations:
@@ -333,13 +366,13 @@ def test_copy_job_finishes_while_source_tree_grows(tmp_path, mocker):
 
     real_copy = vc.copy
 
-    def gated_copy(src_file, destinations, chunk_size=1024 * 1024):
+    def gated_copy(src_file, destinations, chunk_size=1024 * 1024, algorithm="xxh64"):
         if src_file == big_file:
             copy_started.set()
             growth_observed["ok"] = sub_added_after_copy_started.wait(timeout=5) and root_added_after_copy_started.wait(
                 timeout=5
             )
-        return real_copy(src_file, destinations, chunk_size)
+        return real_copy(src_file, destinations, chunk_size, algorithm=algorithm)
 
     mocker.patch("ocopy.verified_copy.copy", side_effect=gated_copy)
 

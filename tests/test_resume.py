@@ -44,7 +44,7 @@ def _seed_resume_state(tmp_path, names: list[str]):
     cp.ensure_exists()
     for f, h in zip(files, digests, strict=True):
         st = f.stat()
-        cp.record(f.name, st.st_size, st.st_mtime, h)
+        cp.record(f.name, st.st_size, st.st_mtime, "xxh64", h)
 
     return src, dest_parent, root, files, digests
 

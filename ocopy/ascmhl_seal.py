@@ -81,12 +81,17 @@ def _file_infos_by_relposix(file_infos: list[FileInfo], source_root: Path) -> di
     return by_rel
 
 
-def seal_ascmhl_at_destination(content_root: Path, source_root: Path, file_infos: list[FileInfo]) -> None:
+def seal_ascmhl_at_destination(
+    content_root: Path,
+    source_root: Path,
+    file_infos: list[FileInfo],
+    algorithm: str = "xxh64",
+) -> None:
     """
     Append one ASC MHL generation under ``content_root`` using hashes from ``file_infos``.
 
     Directory content/structure hashes are omitted (``ascmhl create -n`` parity) to avoid
-    extra implementation surface; per-file records still match ocopy's xxh64.
+    extra implementation surface; per-file records still match ocopy's chosen ``algorithm``.
     """
     root = str(Path(content_root).resolve())
     src_root = source_root.resolve()
@@ -116,7 +121,7 @@ def seal_ascmhl_at_destination(content_root: Path, source_root: Path, file_infos
                 continue
 
             mtime = datetime.datetime.fromtimestamp(fi.mtime)
-            if not session.append_file_hash(file_path, fi.size, mtime, "xxh64", fi.file_hash):
+            if not session.append_file_hash(file_path, fi.size, mtime, algorithm, fi.file_hash):
                 raise ASCMHLSealError(f"ASC MHL hash mismatch while sealing {rel_posix}")
 
         # ``--no_directory_hashes`` parity: record directory entries without content/structure hashes.
@@ -132,10 +137,15 @@ def seal_ascmhl_at_destination(content_root: Path, source_root: Path, file_infos
         raise ASCMHLSealError(f"ASC MHL completeness check failed: {exc}") from exc
 
 
-def seal_ascmhl_destinations(destinations: list[Path], source: Path, file_infos: list[FileInfo]) -> None:
+def seal_ascmhl_destinations(
+    destinations: list[Path],
+    source: Path,
+    file_infos: list[FileInfo],
+    algorithm: str = "xxh64",
+) -> None:
     for dest_root in destinations:
         try:
-            seal_ascmhl_at_destination(dest_root, source, file_infos)
+            seal_ascmhl_at_destination(dest_root, source, file_infos, algorithm=algorithm)
         except ASCMHLSealError as e:
             raise ASCMHLSealError(f"failed sealing destination {dest_root}: {e}") from e
         except (

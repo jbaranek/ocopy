@@ -3,18 +3,39 @@ from functools import lru_cache, partial
 from pathlib import Path
 from queue import Queue
 
-import xxhash
 from ascmhl import errors as ascmhl_errors
 from ascmhl.__version__ import ascmhl_folder_name
+from ascmhl.hasher import Hasher, HashType
 from ascmhl.history import MHLHistory
 
 from ocopy.checkpoint import Checkpoint
 from ocopy.mhl import find_mhl, xxh64_from_legacy_mhl_path
 from ocopy.progress import ProgressPhase, ProgressUpdate, get_progress_queue
 
+SUPPORTED_ALGORITHMS: tuple[str, ...] = tuple(t.name for t in HashType)
+DEFAULT_ALGORITHM = "xxh64"
 
-def get_hash(file_path: Path, progress_queue: Queue[ProgressUpdate] | None = None, total_files: int = 1) -> str:
-    x = xxhash.xxh64()
+
+def _new_hasher(algorithm: str) -> Hasher:
+    """Return an ASC MHL Hasher (``.update(bytes)`` / ``.string_digest()``).
+
+    Reusing ``ascmhl.hasher.HashType`` keeps the algorithm catalog in sync with
+    what ASC MHL itself accepts (incl. C4's custom base58 encoding) without
+    reimplementing it here.
+    """
+    try:
+        return HashType[algorithm].value()
+    except KeyError as e:
+        raise ValueError(f"unsupported hash algorithm: {algorithm!r}") from e
+
+
+def get_hash(
+    file_path: Path,
+    progress_queue: Queue[ProgressUpdate] | None = None,
+    total_files: int = 1,
+    algorithm: str = DEFAULT_ALGORITHM,
+) -> str:
+    x = _new_hasher(algorithm)
 
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -29,15 +50,21 @@ def get_hash(file_path: Path, progress_queue: Queue[ProgressUpdate] | None = Non
                     ),
                 )
 
-    return x.hexdigest()
+    return x.string_digest()
 
 
-def multi_xxhash_check(filenames: list[Path]) -> str:
+def multi_xxhash_check(filenames: list[Path], algorithm: str = DEFAULT_ALGORITHM) -> str:
     with futures.ThreadPoolExecutor(max_workers=len(filenames)) as executor:
         unique_file_hashes = {
             file_hash
             for file_hash in executor.map(
-                partial(get_hash, progress_queue=get_progress_queue(), total_files=len(filenames)), filenames
+                partial(
+                    get_hash,
+                    progress_queue=get_progress_queue(),
+                    total_files=len(filenames),
+                    algorithm=algorithm,
+                ),
+                filenames,
             )
         }
 
@@ -74,7 +101,7 @@ def _innermost_root_with_marker(file_path: Path, marker: str, *, is_dir: bool) -
     return best
 
 
-def _xxh64_from_checkpoint(content_root: Path, file_path: Path) -> str | None:
+def _hash_from_checkpoint(content_root: Path, file_path: Path, algorithm: str) -> str | None:
     try:
         rel = file_path.resolve().relative_to(content_root.resolve()).as_posix()
     except ValueError:
@@ -83,7 +110,7 @@ def _xxh64_from_checkpoint(content_root: Path, file_path: Path) -> str | None:
         st = file_path.stat()
     except OSError:
         return None
-    return Checkpoint(content_root).lookup(rel, st.st_size, st.st_mtime)
+    return Checkpoint(content_root).lookup(rel, st.st_size, st.st_mtime, algorithm)
 
 
 @lru_cache(maxsize=1024)
@@ -115,7 +142,7 @@ def _load_ascmhl_history(content_root: Path) -> MHLHistory | None:
     return _cached_load_ascmhl(str(content_root.resolve()), mtime_ns)
 
 
-def _xxh64_latest_from_ascmhl(content_root: Path, file_path: Path) -> str | None:
+def _hash_latest_from_ascmhl(content_root: Path, file_path: Path, algorithm: str) -> str | None:
     history = _load_ascmhl_history(content_root)
     if history is None:
         return None
@@ -137,33 +164,35 @@ def _xxh64_latest_from_ascmhl(content_root: Path, file_path: Path) -> str | None
             media_hash = hash_list.find_media_hash_for_path(form)
             if media_hash is None or media_hash.is_directory:
                 continue
-            entry = media_hash.find_hash_entry_for_format("xxh64")
+            entry = media_hash.find_hash_entry_for_format(algorithm)
             if entry is not None and entry.hash_string:
                 return entry.hash_string
     return None
 
 
-def find_hash(file_path: Path) -> str | None:
+def find_hash(file_path: Path, algorithm: str = DEFAULT_ALGORITHM) -> str | None:
     ck_root = _innermost_root_with_marker(file_path, Checkpoint.FILENAME, is_dir=False)
     if ck_root is not None:
-        ck_hash = _xxh64_from_checkpoint(ck_root, file_path)
+        ck_hash = _hash_from_checkpoint(ck_root, file_path, algorithm)
         if ck_hash:
             return ck_hash
 
     asc_root = _innermost_root_with_marker(file_path, ascmhl_folder_name, is_dir=True)
     if asc_root is not None:
-        asc_hash = _xxh64_latest_from_ascmhl(asc_root, file_path)
+        asc_hash = _hash_latest_from_ascmhl(asc_root, file_path, algorithm)
         if asc_hash:
             return asc_hash
 
-    dot_mhl = find_mhl(file_path)
-    if dot_mhl:
-        try:
-            rel = file_path.resolve().relative_to(dot_mhl.parent.resolve())
-        except ValueError:
-            return None
-        file_hash = xxh64_from_legacy_mhl_path(dot_mhl, rel)
-        if file_hash:
-            return file_hash
+    # Legacy flat ``*.mhl`` v1.1 only defines ``<xxhash64be>``; no other algorithms.
+    if algorithm == "xxh64":
+        dot_mhl = find_mhl(file_path)
+        if dot_mhl:
+            try:
+                rel = file_path.resolve().relative_to(dot_mhl.parent.resolve())
+            except ValueError:
+                return None
+            file_hash = xxh64_from_legacy_mhl_path(dot_mhl, rel)
+            if file_hash:
+                return file_hash
 
     return None

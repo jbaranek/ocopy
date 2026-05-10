@@ -103,6 +103,45 @@ def test_legacy_mhl_conflicts_with_no_mhl(card):
         assert not (dst / src_dir.name / "ascmhl").exists()
 
 
+@pytest.mark.parametrize("algorithm", ["xxh32", "xxh3", "xxh128", "md5", "sha1", "c4"])
+def test_legacy_mhl_rejects_non_xxh64_algorithm(card, algorithm):
+    """Legacy MHL v1.1 only defines <xxhash64be>; non-xxh64 must fail before copying."""
+    src_dir, destinations = card
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--legacy-mhl", "--hash-algorithm", algorithm, src_dir.as_posix(), *[d.as_posix() for d in destinations]],
+    )
+    assert result.exit_code != 0
+    assert "--legacy-mhl only supports --hash-algorithm xxh64" in result.output
+    for dst in destinations:
+        assert list(dst.glob("**/*.mhl")) == []
+        assert not (dst / src_dir.name / "ascmhl").exists()
+
+
+@pytest.mark.parametrize("algorithm", ["md5", "sha1", "xxh32", "xxh64", "xxh3", "xxh128", "c4"])
+def test_copy_with_hash_algorithm_writes_matching_ascmhl_element(card, algorithm):
+    src_dir, destinations = card
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--hash-algorithm", algorithm, src_dir.as_posix(), *[d.as_posix() for d in destinations]],
+    )
+    assert result.exit_code == 0, result.output
+    assert "missing" not in result.output
+    assert "in progress" not in result.output
+
+    for dst in destinations:
+        root = dst / src_dir.name
+        assert (root / "ascmhl" / "ascmhl_chain.xml").is_file()
+        gen = next((root / "ascmhl").glob("*.mhl"))
+        text = gen.read_text(encoding="utf-8")
+        # Element name in the manifest matches the chosen algorithm.
+        assert re.search(rf"<{algorithm}[^>]*>\s*\S+\s*</{algorithm}>", text), text[:1000]
+
+
 def test_no_mhl(card):
     src_dir, destinations = card
 

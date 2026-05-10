@@ -15,12 +15,10 @@ from shutil import copystat
 from threading import Event, Thread
 from time import sleep
 
-import xxhash
-
 from ocopy.ascmhl_seal import ASCMHLSealError, seal_ascmhl_destinations
 from ocopy.checkpoint import Checkpoint
 from ocopy.file_info import FileInfo
-from ocopy.hash import find_hash, multi_xxhash_check
+from ocopy.hash import DEFAULT_ALGORITHM, _new_hasher, find_hash, multi_xxhash_check
 from ocopy.ignored import is_ignored_basename
 from ocopy.mhl import write_mhl
 from ocopy.progress import ProgressPhase, ProgressUpdate, get_progress_queue
@@ -74,6 +72,7 @@ class _CopyState:
     checkpoints: list[Checkpoint]
     source_tree_root: Path
     need_integrity: bool
+    algorithm: str = DEFAULT_ALGORITHM
     skipped_files: int = 0
 
 
@@ -81,8 +80,13 @@ def _never_cancelled() -> bool:
     return False
 
 
-def copy(src_file: Path, destinations: list[Path], chunk_size: int = 1024 * 1024) -> str:
-    """Copy one file to multiple destinations chunk by chunk, returning its xxh64."""
+def copy(
+    src_file: Path,
+    destinations: list[Path],
+    chunk_size: int = 1024 * 1024,
+    algorithm: str = DEFAULT_ALGORITHM,
+) -> str:
+    """Copy one file to multiple destinations chunk by chunk, returning its hash."""
     queues = [Queue(maxsize=10) for _ in destinations]
 
     def writer(queue: Queue, file_path: Path):
@@ -98,7 +102,7 @@ def copy(src_file: Path, destinations: list[Path], chunk_size: int = 1024 * 1024
     with ThreadPoolExecutor(max_workers=len(destinations)) as executor:
         futures = [executor.submit(writer, queues[i], d) for i, d in enumerate(destinations)]
 
-        x = xxhash.xxh64()
+        x = _new_hasher(algorithm)
         progress_queue = get_progress_queue()
 
         with open(src_file, "rb") as f:
@@ -123,16 +127,17 @@ def copy(src_file: Path, destinations: list[Path], chunk_size: int = 1024 * 1024
     for d in destinations:
         copystat(src_file, d)
 
-    return x.hexdigest()
+    return x.string_digest()
 
 
-def _default_state(source_root: Path, verify: bool) -> _CopyState:
+def _default_state(source_root: Path, verify: bool, algorithm: str = DEFAULT_ALGORITHM) -> _CopyState:
     """Default state for callers (tests, library users) that skip the ``state=`` kwarg."""
     return _CopyState(
         cancel_token=_never_cancelled,
         checkpoints=[],
         source_tree_root=source_root,
         need_integrity=verify,
+        algorithm=algorithm,
     )
 
 
@@ -144,6 +149,7 @@ def copytree(
     skip_existing: bool = False,
     *,
     state: _CopyState | None = None,
+    algorithm: str = DEFAULT_ALGORITHM,
 ) -> list[FileInfo]:
     """Recursively copy ``source`` to each of ``destinations``.
 
@@ -154,7 +160,7 @@ def copytree(
     may omit it and receive default "no cancellation, no checkpoints" behavior.
     """
     if state is None:
-        state = _default_state(source.resolve(), verify)
+        state = _default_state(source.resolve(), verify, algorithm=algorithm)
 
     for d in destinations:
         d.mkdir(parents=True, exist_ok=True)
@@ -209,6 +215,7 @@ def _classify_destinations(
     overwrite: bool,
     skip_existing: bool,
     need_integrity: bool,
+    algorithm: str = DEFAULT_ALGORITHM,
 ) -> tuple[list[int], list[int], list[int], list[str]]:
     """Split destinations into ``(to_copy, to_verify, trusted, trusted_hashes)`` buckets.
 
@@ -246,7 +253,7 @@ def _classify_destinations(
         if not need_integrity:
             continue
 
-        existing = find_hash(dest)
+        existing = find_hash(dest, algorithm)
         if existing:
             trusted_hashes.append(existing)
             trusted_idx.append(i)
@@ -264,6 +271,7 @@ def verified_copy(
     skip_existing: bool = False,
     *,
     state: _CopyState | None = None,
+    algorithm: str = DEFAULT_ALGORITHM,
 ) -> str:
     """Copy ``src_file`` to ``destinations`` with integrity guarantees.
 
@@ -276,7 +284,7 @@ def verified_copy(
     - Verification mismatch + ``overwrite`` -> repair once; second mismatch raises.
     """
     if state is None:
-        state = _default_state(src_file.parent.resolve(), verify)
+        state = _default_state(src_file.parent.resolve(), verify, algorithm=algorithm)
 
     rel_path = src_file.resolve().relative_to(state.source_tree_root.resolve()).as_posix()
 
@@ -296,6 +304,7 @@ def verified_copy(
             overwrite=overwrite,
             skip_existing=skip_existing,
             need_integrity=state.need_integrity,
+            algorithm=state.algorithm,
         )
 
         # Nothing to copy and nothing to re-verify: either every destination is a
@@ -309,7 +318,7 @@ def verified_copy(
                     raise VerificationError(f"Conflicting trusted hashes for {src_file}")
                 digest = trusted_hashes[0]
                 s = src_stat()
-                _record_checkpoints(state.checkpoints, rel_path, s.st_size, s.st_mtime, digest)
+                _record_checkpoints(state.checkpoints, rel_path, s.st_size, s.st_mtime, state.algorithm, digest)
                 state.skipped_files += len(trusted_idx)
                 return digest
             state.skipped_files += len(destinations)
@@ -319,7 +328,7 @@ def verified_copy(
         copy_hash: str | None = None
         if tmps:
             try:
-                copy_hash = copy(src_file, tmps)
+                copy_hash = copy(src_file, tmps, algorithm=state.algorithm)
             except BaseException:
                 _cleanup_tmps(tmps)
                 raise
@@ -341,7 +350,7 @@ def verified_copy(
                 return copy_hash
 
             if need_pool_verify:
-                combined = multi_xxhash_check(pool)
+                combined = multi_xxhash_check(pool, algorithm=state.algorithm)
                 if combined == "hashes_do_not_match":
                     last_attempt = attempt == max_attempts - 1
                     if not overwrite or last_attempt:
@@ -356,15 +365,16 @@ def verified_copy(
                 assert copy_hash is not None
                 digest = copy_hash
 
-            present_hash = find_hash(src_file)
+            present_hash = find_hash(src_file, state.algorithm)
             if present_hash and present_hash != digest:
                 raise VerificationError(
-                    f"Verification failed for {src_file}. xxHash present on source medium is not correct"
+                    f"Verification failed for {src_file}. "
+                    f"{state.algorithm} hash present on source medium is not correct"
                 )
 
             _rename_tmps(tmps, [destinations[i] for i in copy_idx])
             s = src_stat()
-            _record_checkpoints(state.checkpoints, rel_path, s.st_size, s.st_mtime, digest)
+            _record_checkpoints(state.checkpoints, rel_path, s.st_size, s.st_mtime, state.algorithm, digest)
             # ``verify_idx`` destinations were present already and did not receive new bytes,
             # so they count as skipped (just with a paid-for verification read).
             state.skipped_files += len(verify_idx) + len(trusted_idx)
@@ -376,9 +386,11 @@ def verified_copy(
     raise AssertionError("unreachable: verified_copy retry loop exited without returning")
 
 
-def _record_checkpoints(checkpoints: list[Checkpoint], rel_path: str, size: int, mtime: float, digest: str) -> None:
+def _record_checkpoints(
+    checkpoints: list[Checkpoint], rel_path: str, size: int, mtime: float, algorithm: str, digest: str
+) -> None:
     for cp in checkpoints:
-        cp.record(rel_path, size, mtime, digest)
+        cp.record(rel_path, size, mtime, algorithm, digest)
 
 
 def _cleanup_tmps(tmps: list[Path]) -> None:
@@ -401,6 +413,7 @@ def copy_and_seal(
     mhl: bool = True,
     legacy_mhl: bool = False,
     cancel_token: CancelToken | None = None,
+    algorithm: str = DEFAULT_ALGORITHM,
 ) -> CopyResult:
     """Copy ``source`` into each destination and (optionally) seal an ASC MHL.
 
@@ -421,6 +434,7 @@ def copy_and_seal(
         checkpoints=checkpoints,
         source_tree_root=source.resolve(),
         need_integrity=mhl or verify,
+        algorithm=algorithm,
     )
 
     file_infos = copytree(
@@ -444,11 +458,21 @@ def copy_and_seal(
 
     if mhl:
         if legacy_mhl:
+            if algorithm != "xxh64":
+                raise CopyTreeError(
+                    [
+                        ErrorListEntry(
+                            source,
+                            dest_roots,
+                            f"--legacy-mhl only supports xxh64, got {algorithm!r}",
+                        )
+                    ]
+                )
             start = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
             write_mhl(dest_roots, file_infos, source, start)
         else:
             try:
-                seal_ascmhl_destinations(dest_roots, source, file_infos)
+                seal_ascmhl_destinations(dest_roots, source, file_infos, algorithm=algorithm)
             except ASCMHLSealError as err:
                 raise CopyTreeError([ErrorListEntry(source, dest_roots, str(err))]) from err
 
@@ -476,6 +500,7 @@ class CopyJob(Thread):
         legacy_mhl: bool = False,
         auto_start: bool = True,
         cancel_token: CancelToken | None = None,
+        algorithm: str = DEFAULT_ALGORITHM,
     ):
         super().__init__()
         self.daemon = True
@@ -494,6 +519,7 @@ class CopyJob(Thread):
         self.skip_existing = skip_existing
         self.mhl = mhl
         self.legacy_mhl = legacy_mhl
+        self.algorithm = algorithm
 
         # Pre-compute checkpoint paths so CLI cancel reporting works even before
         # the run thread has had a chance to create the files on disk.
@@ -583,6 +609,7 @@ class CopyJob(Thread):
                     mhl=self.mhl,
                     legacy_mhl=self.legacy_mhl,
                     cancel_token=self._cancel_token,
+                    algorithm=self.algorithm,
                 )
             except CopyTreeError as e:
                 self.errors = e.args[0]

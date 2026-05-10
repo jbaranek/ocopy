@@ -8,6 +8,7 @@ import click
 
 from ocopy.backup_check import get_missing
 from ocopy.cli.update import Updater, suggested_update_command
+from ocopy.hash import DEFAULT_ALGORITHM, SUPPORTED_ALGORITHMS
 from ocopy.sleep_inhibit import sleep_inhibit_best_effort
 from ocopy.utils import folder_size, free_space, get_mount
 from ocopy.verified_copy import CopyJob
@@ -42,8 +43,15 @@ def _report_cancelled(job: CopyJob, machine_readable: bool) -> None:
 )
 @click.option(
     "--verify/--dont-verify",
-    help="Verify copy by re-calculating the xxHash of the source and all destinations (defaults to --verify)",
+    help="Verify copy by re-calculating the hash of the source and all destinations (defaults to --verify)",
     default=True,
+)
+@click.option(
+    "--hash-algorithm",
+    type=click.Choice(list(SUPPORTED_ALGORITHMS)),
+    default=DEFAULT_ALGORITHM,
+    show_default=True,
+    help="Hash algorithm used for verification and manifests.",
 )
 @click.option(
     "--skip-existing/--dont-skip",
@@ -80,6 +88,7 @@ def cli(
     ctx: click.Context,
     overwrite: bool,
     verify: bool,
+    hash_algorithm: str,
     skip_existing: bool,
     machine_readable: bool,
     mhl: bool,
@@ -97,6 +106,8 @@ def cli(
     if legacy_mhl:
         if not mhl and ctx.get_parameter_source("mhl") == click.core.ParameterSource.COMMANDLINE:
             raise click.UsageError("--legacy-mhl cannot be combined with --no-mhl")
+        if hash_algorithm != "xxh64":
+            raise click.UsageError("--legacy-mhl only supports --hash-algorithm xxh64")
         mhl = True
 
     updater = Updater()
@@ -125,6 +136,7 @@ def cli(
             skip_existing=skip_existing,
             mhl=mhl,
             legacy_mhl=legacy_mhl,
+            algorithm=hash_algorithm,
         )
         if machine_readable:
             for _ in job.progress:

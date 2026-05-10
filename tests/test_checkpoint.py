@@ -10,9 +10,11 @@ def test_checkpoint_roundtrip(tmp_path):
     root = tmp_path / "dest_root"
     cp = Checkpoint(root)
     cp.ensure_exists()
-    cp.record("foo/bar.txt", 12, 1234.0, "abcd" * 4)
-    assert cp.lookup("foo/bar.txt", 12, 1234.0) == "abcd" * 4
-    assert cp.lookup("foo/bar.txt", 12, 9999.0) is None
+    cp.record("foo/bar.txt", 12, 1234.0, "xxh64", "abcd" * 4)
+    assert cp.lookup("foo/bar.txt", 12, 1234.0, "xxh64") == "abcd" * 4
+    assert cp.lookup("foo/bar.txt", 12, 9999.0, "xxh64") is None
+    # A different algorithm with the same coordinates is a miss.
+    assert cp.lookup("foo/bar.txt", 12, 1234.0, "xxh3") is None
 
 
 def test_checkpoint_truncated_last_record_ignored(tmp_path):
@@ -20,8 +22,8 @@ def test_checkpoint_truncated_last_record_ignored(tmp_path):
     root = tmp_path / "r"
     cp = Checkpoint(root)
     cp.ensure_exists()
-    cp.record("a.txt", 1, 1.0, "a" * 16)
-    cp.record("b.txt", 2, 2.0, "b" * 16)
+    cp.record("a.txt", 1, 1.0, "xxh64", "a" * 16)
+    cp.record("b.txt", 2, 2.0, "xxh64", "b" * 16)
 
     # Surgically chop the final record in half, mid-JSON, without a trailing newline.
     raw = cp.path.read_bytes()
@@ -29,8 +31,8 @@ def test_checkpoint_truncated_last_record_ignored(tmp_path):
     cp.path.write_bytes(raw[: first_nl + 1] + b'{"rel_path":"b.txt","siz')
 
     # The fully-written first record is still recoverable; the truncated one is not.
-    assert cp.lookup("a.txt", 1, 1.0) == "a" * 16
-    assert cp.lookup("b.txt", 2, 2.0) is None
+    assert cp.lookup("a.txt", 1, 1.0, "xxh64") == "a" * 16
+    assert cp.lookup("b.txt", 2, 2.0, "xxh64") is None
 
 
 def test_checkpoint_in_ignored_paths():
@@ -45,7 +47,7 @@ def test_checkpoint_clear(tmp_path):
     root = tmp_path / "r"
     cp = Checkpoint(root)
     cp.ensure_exists()
-    cp.record("x", 1, 1.0, "b" * 16)
+    cp.record("x", 1, 1.0, "xxh64", "b" * 16)
     cp.clear()
     assert not cp.path.exists()
 
@@ -55,6 +57,29 @@ def test_checkpoint_lookup_cache_invalidated_by_record(tmp_path):
     root = tmp_path / "r"
     cp = Checkpoint(root)
     cp.ensure_exists()
-    assert cp.lookup("x", 1, 1.0) is None
-    cp.record("x", 1, 1.0, "c" * 16)
-    assert cp.lookup("x", 1, 1.0) == "c" * 16
+    assert cp.lookup("x", 1, 1.0, "xxh64") is None
+    cp.record("x", 1, 1.0, "xxh64", "c" * 16)
+    assert cp.lookup("x", 1, 1.0, "xxh64") == "c" * 16
+
+
+def test_checkpoint_legacy_xxh64_record_is_readable(tmp_path):
+    """A pre-migration checkpoint line ({rel_path,size,mtime,xxh64}) must still resolve."""
+    root = tmp_path / "r"
+    cp = Checkpoint(root)
+    cp.ensure_exists()
+    legacy_line = b'{"mtime":1.0,"rel_path":"old.txt","size":7,"xxh64":"deadbeefdeadbeef"}\n'
+    cp.path.write_bytes(legacy_line)
+    assert cp.lookup("old.txt", 7, 1.0, "xxh64") == "deadbeefdeadbeef"
+    # Legacy records were always xxh64 — looking up a different algorithm should miss.
+    assert cp.lookup("old.txt", 7, 1.0, "xxh3") is None
+
+
+def test_checkpoint_per_algorithm_isolation(tmp_path):
+    """Two records with the same path/size/mtime but different algorithms coexist."""
+    root = tmp_path / "r"
+    cp = Checkpoint(root)
+    cp.ensure_exists()
+    cp.record("f.bin", 4, 10.0, "xxh64", "1" * 16)
+    cp.record("f.bin", 4, 10.0, "xxh3", "2" * 16)
+    assert cp.lookup("f.bin", 4, 10.0, "xxh64") == "1" * 16
+    assert cp.lookup("f.bin", 4, 10.0, "xxh3") == "2" * 16
