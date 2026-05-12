@@ -82,7 +82,8 @@ Emitted on each percent tick (≈100 events for a complete run, fewer if the run
 | `percent` | int | 0–100, monotonically non-decreasing. |
 | `phase` | string | `"copy"` or `"verify"`. Verify only appears when `--verify` is on. |
 | `current_file` | string \| null | Basename of the file currently being processed. `null` until the first chunk lands. |
-| `speed_bytes_per_sec` | float | Live throughput at emit time (bytes/second). |
+| `speed_bytes_per_sec` | float | Windowed live throughput at emit time (bytes/second). Computed over the trailing ~5 seconds of the **current phase**; falls back to cumulative until enough samples accumulate. **Differs** from the same-named field on `result`, which is the cumulative run average. |
+| `eta_seconds` | float | Estimated remaining time in seconds. Projects remaining copy work at the current copy rate and remaining verify work at the current verify rate; before verify samples exist, verify is projected at the copy rate (conservative). `0` once the run is finished. |
 
 ### `result`
 
@@ -131,9 +132,9 @@ The terminal event. Exactly one per run.
 
 ```
 {"type":"start","ts":1731350400.12,"schema_version":1,"source":"/Volumes/Card/A001","destinations":["/Volumes/Backup1/A001"],"hash_algorithm":"xxh64","verify":true,"skip_existing":true,"mhl":true,"legacy_mhl":false,"total_bytes":12345678}
-{"type":"progress","ts":1731350401.01,"percent":4,"phase":"copy","current_file":"clip_001.mov","speed_bytes_per_sec":5.0e7}
-{"type":"progress","ts":1731350405.40,"percent":52,"phase":"copy","current_file":"clip_004.mov","speed_bytes_per_sec":6.1e7}
-{"type":"progress","ts":1731350410.55,"percent":98,"phase":"verify","current_file":"clip_008.mov","speed_bytes_per_sec":5.9e7}
+{"type":"progress","ts":1731350401.01,"percent":4,"phase":"copy","current_file":"clip_001.mov","speed_bytes_per_sec":5.0e7,"eta_seconds":18.4}
+{"type":"progress","ts":1731350405.40,"percent":52,"phase":"copy","current_file":"clip_004.mov","speed_bytes_per_sec":6.1e7,"eta_seconds":9.7}
+{"type":"progress","ts":1731350410.55,"percent":98,"phase":"verify","current_file":"clip_008.mov","speed_bytes_per_sec":1.4e8,"eta_seconds":0.3}
 {"type":"result","status":"ok","ts":1731350410.92,"files_copied":8,"files_skipped":0,"bytes_copied":12345678,"duration_s":10.80,"speed_bytes_per_sec":5.7e7,"destinations":["/Volumes/Backup1/A001"],"hash_algorithm":"xxh64"}
 ```
 

@@ -278,6 +278,8 @@ class _FakeCancelledJob:
         self.skipped_files = 0
         self.errors = []
         self.speed = 1.0
+        self.live_speed = 1.0
+        self.eta_seconds = 0.0
         self.elapsed = 1.0
         self.current_item = None
         self.current_phase = "copy"
@@ -410,12 +412,13 @@ def test_machine_readable_success(card):
     assert events[-1]["duration_s"] > 0
     assert events[-1]["hash_algorithm"] == "xxh64"
 
-    # Progress events carry phase + speed
+    # Progress events carry phase + speed + ETA
     progress_events = [ev for ev in events if ev["type"] == "progress"]
     assert progress_events, "expected at least one progress event"
     for ev in progress_events:
         assert ev["phase"] in {"copy", "verify"}
         assert ev["speed_bytes_per_sec"] >= 0
+        assert ev["eta_seconds"] >= 0
         assert 0 <= ev["percent"] <= 100
 
 

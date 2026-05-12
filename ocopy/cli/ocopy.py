@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import sys
 import time
 from pathlib import Path
@@ -165,13 +166,24 @@ def cli(
                     percent=job.percent_done,
                     phase=job.current_phase,
                     current_file=job.current_item,
-                    speed_bytes_per_sec=job.speed,
+                    speed_bytes_per_sec=job.live_speed,
+                    eta_seconds=job.eta_seconds,
                 )
         else:
+
+            def _fmt_eta(seconds: float) -> str:
+                if not math.isfinite(seconds) or seconds < 0:
+                    return "--:--"
+                s = int(seconds)
+                return f"{s // 60:02d}:{s % 60:02d}"
+
             with click.progressbar(
                 job.progress,
                 length=100,
-                item_show_func=lambda name: f"{name or ''} — {job.speed / 1_000_000:.1f} MB/s",
+                show_eta=False,
+                item_show_func=lambda name: (
+                    f"{name or ''} — {job.live_speed / 1_000_000:.1f} MB/s — ETA {_fmt_eta(job.eta_seconds)}"
+                ),
             ) as progress:
                 for _ in progress:
                     pass

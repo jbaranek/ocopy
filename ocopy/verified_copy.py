@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import math
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import as_completed
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -23,6 +25,16 @@ from ocopy.ignored import is_ignored_basename
 from ocopy.mhl import write_mhl
 from ocopy.progress import ProgressPhase, ProgressUpdate, get_progress_queue
 from ocopy.utils import folder_size, threaded
+
+SPEED_WINDOW_S = 5.0
+"""Window length (seconds) for live throughput sampling."""
+
+MIN_RATE_WINDOW_S = 0.1
+"""Minimum sample-span (seconds) before a windowed rate is trusted.
+
+Below this we fall back to the cumulative rate rather than risk a noisy
+small-denominator division across just a few chunks.
+"""
 
 CancelToken = Callable[[], bool]
 """Cancellation signal callable: returns True once the caller should stop."""
@@ -531,6 +543,10 @@ class CopyJob(Thread):
         self.total_done = 0.0
         self.current_item = None
         self.current_phase: str = "copy"
+        self._copy_bytes_done: float = 0.0
+        self._verify_bytes_done: float = 0.0
+        self._samples_copy: deque[tuple[float, float]] = deque()
+        self._samples_verify: deque[tuple[float, float]] = deque()
         self.finished = False
         self._start_time = time.time()
 
@@ -573,13 +589,20 @@ class CopyJob(Thread):
             if name.endswith(".copy_in_progress"):
                 name = name.removesuffix(".copy_in_progress")
             self.current_item = name
+            now = time.time()
             if update.phase == ProgressPhase.VERIFY:
                 self.current_phase = "verify"
-                denom = max(1, update.parallel_verify_readers)
-                self.total_done += update.nbytes / denom
+                contrib = update.nbytes / max(1, update.parallel_verify_readers)
+                self._verify_bytes_done += contrib
+                self.total_done += contrib
+                self._samples_verify.append((now, self._verify_bytes_done))
             else:
                 self.current_phase = "copy"
+                self._copy_bytes_done += update.nbytes
                 self.total_done += update.nbytes
+                self._samples_copy.append((now, self._copy_bytes_done))
+            self._prune(self._samples_copy, now)
+            self._prune(self._samples_verify, now)
 
     @property
     def percent_done(self) -> int:
@@ -592,6 +615,66 @@ class CopyJob(Thread):
     @property
     def speed(self) -> float:
         return (self.total_done / 2 if self.verify else self.total_done) / self.elapsed
+
+    @staticmethod
+    def _prune(samples: deque[tuple[float, float]], now: float) -> None:
+        cutoff = now - SPEED_WINDOW_S
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
+
+    @staticmethod
+    def _windowed_rate(samples: deque[tuple[float, float]]) -> float | None:
+        snap = list(samples)
+        if len(snap) < 2:
+            return None
+        t0, b0 = snap[0]
+        t1, b1 = snap[-1]
+        dt = t1 - t0
+        if dt < MIN_RATE_WINDOW_S:
+            return None
+        return (b1 - b0) / dt
+
+    @property
+    def live_speed_copy(self) -> float:
+        rate = self._windowed_rate(self._samples_copy)
+        if rate is not None:
+            return rate
+        return self._copy_bytes_done / self.elapsed if self.elapsed > 0 else 0.0
+
+    @property
+    def live_speed_verify(self) -> float:
+        rate = self._windowed_rate(self._samples_verify)
+        if rate is not None:
+            return rate
+        # No verify data yet — fall back to copy speed (conservative).
+        return self.live_speed_copy
+
+    @property
+    def live_speed(self) -> float:
+        """Current-phase windowed throughput for live display."""
+        return self.live_speed_verify if self.current_phase == "verify" else self.live_speed_copy
+
+    @property
+    def eta_seconds(self) -> float:
+        """Honest remaining-time estimate using per-phase windowed rates.
+
+        Returns ``math.inf`` when no live speed sample is available yet — callers
+        render that as "unknown" rather than a misleading huge number.
+        """
+        if self.total_done >= self.todo_size or self.todo_size == 0:
+            return 0.0
+        copy_speed = self.live_speed_copy
+        if copy_speed <= 0:
+            return math.inf
+        copy_remaining = max(0.0, self.total_size - self._copy_bytes_done)
+        if not self.verify:
+            return copy_remaining / copy_speed
+        # ``todo_size = total_size * 2`` when verify is on; verify-leg work in weighted units is total_size.
+        verify_speed = self.live_speed_verify
+        if verify_speed <= 0:
+            return math.inf
+        verify_remaining = max(0.0, self.total_size - self._verify_bytes_done)
+        return copy_remaining / copy_speed + verify_remaining / verify_speed
 
     @property
     def progress(self) -> Iterator[str | None]:

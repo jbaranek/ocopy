@@ -65,6 +65,7 @@ class JSONLEmitter:
         phase: str,
         current_file: str | None,
         speed_bytes_per_sec: float,
+        eta_seconds: float,
     ) -> None:
         click.echo(
             _dump(
@@ -75,6 +76,7 @@ class JSONLEmitter:
                     "phase": phase,
                     "current_file": current_file,
                     "speed_bytes_per_sec": speed_bytes_per_sec,
+                    "eta_seconds": eta_seconds,
                 }
             )
         )
