@@ -7,7 +7,7 @@ from time import sleep
 
 import pytest
 
-from ocopy.hash import find_hash, get_hash
+from ocopy.hash import SUPPORTED_ALGORITHMS, _new_hasher, find_hash, get_hash
 from ocopy.utils import folder_size
 from ocopy.verified_copy import (
     CopyJob,
@@ -75,6 +75,18 @@ def test_get_hash(tmpdir, algorithm):
 
     p.write_text("X" * 1024 * 1024 * 16)
     assert get_hash(p, algorithm=algorithm) == _HASH_VECTORS_16MB_OF_X[algorithm]
+
+
+def test_new_hasher_rejects_unsupported_algorithm():
+    """``_new_hasher`` is the single chokepoint for algorithm selection; an unknown
+    name must surface as ``ValueError`` (with the algorithm in the message) rather
+    than fall back silently. Locks in the contract that ``SUPPORTED_ALGORITHMS``
+    is the authoritative whitelist."""
+    with pytest.raises(ValueError, match="unsupported hash algorithm"):
+        _new_hasher("not-a-real-algo")
+    # Sanity: every advertised algorithm constructs.
+    for name in SUPPORTED_ALGORITHMS:
+        _new_hasher(name)
 
 
 def test_folder_size(tmpdir):

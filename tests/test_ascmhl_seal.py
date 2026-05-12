@@ -9,8 +9,10 @@ from pathlib import Path
 import pytest
 from ascmhl.history import MHLHistory
 
-from ocopy.ascmhl_seal import ASCMHLSealError, seal_ascmhl_destinations
-from ocopy.verified_copy import copy_and_seal, copytree
+from ascmhl.__version__ import ascmhl_folder_name
+
+from ocopy.ascmhl_seal import ASCMHLSealError, seal_ascmhl_at_destination, seal_ascmhl_destinations
+from ocopy.verified_copy import CopyTreeError, copy_and_seal, copytree
 
 pytest.importorskip("ascmhl")
 
@@ -200,3 +202,41 @@ def test_legacy_mhl_writes_flat_manifest(tmp_path):
     flat = list(dest.glob("*.mhl"))
     assert len(flat) == 1
     assert not (dest / "ascmhl").exists()
+
+
+def test_legacy_mhl_with_non_xxh64_algorithm_raises_in_library_api(tmp_path):
+    """The legacy flat MHL v1.1 schema only defines ``<xxhash64be>``. Passing any
+    other algorithm to ``copy_and_seal(legacy_mhl=True)`` must surface as a
+    ``CopyTreeError`` — this is the library-level guard that backs the CLI's own
+    rejection, for programmatic callers (GUI, scripts) that bypass the CLI."""
+    srcdir = tmp_path / "srcdir"
+    srcdir.mkdir()
+    (srcdir / "a.bin").write_bytes(b"x")
+
+    dst_root = tmp_path / "dst"
+    dst_root.mkdir()
+
+    with pytest.raises(CopyTreeError) as exc:
+        copy_and_seal(srcdir, [dst_root], mhl=True, legacy_mhl=True, algorithm="xxh3")
+    assert "xxh64" in exc.value.args[0][0].error_message
+
+
+def test_seal_against_half_bootstrapped_ascmhl_folder_raises(tmp_path):
+    """An ``ascmhl/`` directory without a chain file (e.g. an interrupted bootstrap
+    or a manually-created empty folder) must surface as ``ASCMHLSealError`` rather
+    than continuing as if no history existed. ``_load_or_bootstrap_history`` sees
+    a real dir and tries ``MHLHistory.load_from_path``, which raises
+    ``NoMHLChainException``; the seal layer wraps that into ``ASCMHLSealError``."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.bin").write_bytes(b"x")
+
+    dst_parent = tmp_path / "dst"
+    dst_parent.mkdir()
+    infos = copytree(src, [dst_parent])
+
+    # Create an empty ascmhl/ at the destination root — no chain, no manifests.
+    (dst_parent / ascmhl_folder_name).mkdir()
+
+    with pytest.raises(ASCMHLSealError, match="missing chain"):
+        seal_ascmhl_at_destination(dst_parent, src, infos)

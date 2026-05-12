@@ -93,6 +93,37 @@ def test_no_mhl_dont_verify_skip_zero_extra_reads(tmp_path, mocker):
     assert not (dst_root / "ascmhl").exists()
 
 
+def test_dont_verify_with_mhl_uses_streamed_copy_digest(tmp_path, mocker):
+    """``verify=False`` + ``mhl=True`` on a fresh destination must seal using the
+    digest produced by the streamed copy, without a pool re-read.
+
+    This is the documented "fast bulk copy with a manifest" mode: the user opts
+    out of the verification pool but still wants an MHL. The manifest gets the
+    same digest the bytes were hashed to during the copy itself.
+    """
+    pool_spy = mocker.spy(
+        importlib.import_module("ocopy.verified_copy"),
+        "multi_xxhash_check",
+    )
+
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "f.bin"
+    payload = b"verify-off-mhl-on"
+    f.write_bytes(payload)
+
+    d1 = tmp_path / "d1"
+    d1.mkdir()
+
+    copy_and_seal(src, [d1], verify=False, mhl=True)
+
+    assert pool_spy.call_count == 0, "verify=False must not trigger pool re-reads"
+    dst_file = d1 / "src" / "f.bin"
+    assert dst_file.read_bytes() == payload
+    assert (d1 / "src" / "ascmhl").is_dir()
+    assert find_hash(dst_file) == get_hash(f)
+
+
 def test_mixed_destinations_single_multi_verify_pool(tmp_path, mocker):
     """One destination exists + needs verify, one missing -> exactly one pool."""
     multi = mocker.spy(importlib.import_module("ocopy.verified_copy"), "multi_xxhash_check")
