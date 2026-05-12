@@ -25,8 +25,10 @@
 [uv](https://docs.astral.sh/uv/) is an extremely fast Python package and project manager, written in Rust. If you do not have it yet: with [Homebrew](https://brew.sh/), run `brew install uv`; for the official standalone installer and everything else, see [Installing uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```shell
-uv tool install ocopy
+uv tool install --python 3.14 ocopy
 ```
+
+`--python 3.14` pins the interpreter to the latest stable Python; uv will download a managed one automatically if you don't have it. Without it, uv picks the lowest version that satisfies o/COPY's `requires-python` (currently 3.11), which is fine but ages faster.
 
 Update an existing install:
 
@@ -36,10 +38,10 @@ uv tool upgrade ocopy
 
 ### With pipx
 
-If you prefer the pip ecosystem, [pipx](https://pipx.pypa.io/) does the same job as `uv tool install`: it puts each CLI app in its own environment and exposes the `ocopy` command on your `PATH`.
+If you prefer the pip ecosystem, [pipx](https://pipx.pypa.io/) does the same job as `uv tool install`: it puts each CLI app in its own environment and exposes the `ocopy` command on your `PATH`. Make sure `python3.14` is on your `PATH` first (Homebrew: `brew install python@3.14`).
 
 ```shell
-pipx install ocopy
+pipx install --python python3.14 ocopy
 ```
 
 ```shell
