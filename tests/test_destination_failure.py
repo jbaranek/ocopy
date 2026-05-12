@@ -34,6 +34,60 @@ import pytest
 from ocopy.verified_copy import CopyJob
 
 
+def test_destination_writer_failure_on_large_file_does_not_deadlock(tmp_path, mocker):
+    """A writer that raises mid-stream on a file larger than the per-queue buffer
+    must surface as an error, not hang.
+
+    Regression for a deadlock in :func:`ocopy.verified_copy.copy`: per-destination
+    ``Queue(maxsize=10)``; if a writer's ``write()`` raised after consuming a few
+    chunks, the queue would fill and the reader's blocking ``q.put`` would hang
+    forever. Reproduced with a 20 MB file (20 chunks of 1 MB) and a victim writer
+    whose first ``write`` raises ENOSPC.
+
+    The pre-existing ``..._unmount_mid_copy_surfaces_error`` test doesn't trigger
+    this path because its 8 KB files produce a single ``q.put`` per file — well
+    below the queue capacity — so the reader never blocks even when the writer
+    is dead.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "big.mov").write_bytes(b"x" * (20 * 1024 * 1024))
+
+    dst_ok = tmp_path / "dst_ok"
+    dst_victim = tmp_path / "dst_victim"
+    dst_ok.mkdir()
+    dst_victim.mkdir()
+
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        handle = real_open(file, *args, **kwargs)
+        path_str = os.fspath(file)
+        if str(dst_victim) in path_str and ".copy_in_progress" in path_str:
+            original_write = handle.write
+            armed = {"first": True}
+
+            def bad_write(data):
+                if armed["first"]:
+                    armed["first"] = False
+                    raise OSError(errno.ENOSPC, "No space left on device", path_str)
+                return original_write(data)
+
+            handle.write = bad_write
+        return handle
+
+    mocker.patch("builtins.open", side_effect=fake_open)
+
+    job = CopyJob(src, [dst_ok, dst_victim], verify=True, mhl=False)
+    job.join(timeout=60)
+
+    assert job.finished, "CopyJob hung after a mid-stream writer failure on a large file"
+    assert job.errors, "expected CopyJob.errors to surface the writer failure"
+    assert any("No space left" in e.error_message for e in job.errors), (
+        f"expected the ENOSPC message in job.errors, got: {[e.error_message for e in job.errors]}"
+    )
+
+
 def test_destination_unmount_mid_copy_surfaces_error(tmp_path, mocker):
     """Issue #15: mid-copy destination I/O failure must surface on ``CopyJob.errors``."""
     src = tmp_path / "src"

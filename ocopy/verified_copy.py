@@ -8,11 +8,11 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import as_completed
+from concurrent.futures import Future, as_completed
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from shutil import copystat
 from threading import Event, Thread
 from time import sleep
@@ -98,40 +98,78 @@ def copy(
     chunk_size: int = 1024 * 1024,
     algorithm: str = DEFAULT_ALGORITHM,
 ) -> str:
-    """Copy one file to multiple destinations chunk by chunk, returning its hash."""
-    queues = [Queue(maxsize=10) for _ in destinations]
+    """Copy one file to multiple destinations chunk by chunk, returning its hash.
 
-    def writer(queue: Queue, file_path: Path):
+    A mid-stream writer failure (ENOSPC, ENODEV on a yanked drive, etc.) is
+    surfaced as an exception rather than a hang: the reader polls each writer's
+    future between bounded ``q.put`` waits, and an ``abort`` event lets the
+    surviving writer threads exit promptly so the executor can shut down. A
+    naive blocking ``q.put`` on a per-destination queue with ``maxsize=10``
+    would otherwise deadlock once the failed writer's queue fills.
+    """
+    queues: list[Queue] = [Queue(maxsize=10) for _ in destinations]
+    abort = Event()
+
+    def writer(queue: Queue, file_path: Path) -> None:
         with open(file_path, "wb") as dest_f:
-            while True:
-                write_chunk = queue.get()
+            while not abort.is_set():
+                try:
+                    write_chunk = queue.get(timeout=0.5)
+                except Empty:
+                    continue
                 if not write_chunk:
                     queue.task_done()
-                    break
+                    return
                 dest_f.write(write_chunk)
                 queue.task_done()
 
+    def _enqueue(queue: Queue, future: Future, chunk: bytes) -> None:
+        """``queue.put(chunk)`` that re-raises the writer's exception on death.
+
+        Without the death check, a writer that raised mid-stream would leave its
+        queue undrained; once full, the reader's blocking put would hang forever.
+        """
+        while True:
+            try:
+                queue.put(chunk, timeout=0.5)
+                return
+            except Full:
+                if future.done():
+                    # If the writer raised, ``.result()`` re-raises that exception.
+                    # If it returned cleanly without consuming the rest of the queue
+                    # (shouldn't happen in normal flow) treat that as a protocol
+                    # violation rather than a silent hang.
+                    future.result()
+                    raise OSError("destination writer ended without consuming all chunks")
+
     with ThreadPoolExecutor(max_workers=len(destinations)) as executor:
-        futures = [executor.submit(writer, queues[i], d) for i, d in enumerate(destinations)]
+        futures: list[Future] = [executor.submit(writer, queues[i], d) for i, d in enumerate(destinations)]
 
         x = _new_hasher(algorithm)
         progress_queue = get_progress_queue()
 
-        with open(src_file, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                for q in queues:
-                    q.put(chunk)
+        try:
+            with open(src_file, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    for q, fut in zip(queues, futures, strict=True):
+                        _enqueue(q, fut, chunk)
 
-                if not chunk:
-                    break
+                    if not chunk:
+                        break
 
-                x.update(chunk)
-                if progress_queue:
-                    progress_queue.put(ProgressUpdate(ProgressPhase.COPY, src_file, len(chunk)))
+                    x.update(chunk)
+                    if progress_queue:
+                        progress_queue.put(ProgressUpdate(ProgressPhase.COPY, src_file, len(chunk)))
 
-        for future in as_completed(futures):
-            future.result()
+            for future in as_completed(futures):
+                future.result()
+        except BaseException:
+            # Unblock any surviving writers so the executor's shutdown(wait=True)
+            # in ``with ThreadPoolExecutor`` can complete promptly. Writers poll
+            # ``abort`` between bounded ``queue.get`` waits.
+            abort.set()
+            raise
 
     for q in queues:
         q.join()
