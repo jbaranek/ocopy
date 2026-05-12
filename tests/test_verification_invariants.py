@@ -105,7 +105,7 @@ def test_verification_retry_exhausts_with_overwrite(tmp_path, mocker):
     The repair-retry loop is bounded at 2 attempts. After a second mismatch the
     error must surface (no infinite loop, no silent skip).
     """
-    mocker.patch(
+    patched = mocker.patch(
         "ocopy.verified_copy.multi_xxhash_check",
         return_value="hashes_do_not_match",
     )
@@ -123,9 +123,7 @@ def test_verification_retry_exhausts_with_overwrite(tmp_path, mocker):
         verified_copy(f, [dst_file], overwrite=True)
 
     # Both attempts must have run; mock fired twice.
-    from ocopy.verified_copy import multi_xxhash_check as patched
-
-    assert patched.call_count == 2  # type: ignore[attr-defined]
+    assert patched.call_count == 2
     # No tmp or final dst should survive a failed retry.
     assert not dst_file.exists()
     assert not dst_file.with_name(dst_file.name + ".copy_in_progress").exists()
