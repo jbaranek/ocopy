@@ -140,7 +140,7 @@ def copy(
                     # (shouldn't happen in normal flow) treat that as a protocol
                     # violation rather than a silent hang.
                     future.result()
-                    raise OSError("destination writer ended without consuming all chunks")
+                    raise OSError("destination writer ended without consuming all chunks") from None
 
     with ThreadPoolExecutor(max_workers=len(destinations)) as executor:
         futures: list[Future] = [executor.submit(writer, queues[i], d) for i, d in enumerate(destinations)]

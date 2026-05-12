@@ -7,9 +7,8 @@ import re
 from pathlib import Path
 
 import pytest
-from ascmhl.history import MHLHistory
-
 from ascmhl.__version__ import ascmhl_folder_name
+from ascmhl.history import MHLHistory
 
 from ocopy.ascmhl_seal import ASCMHLSealError, seal_ascmhl_at_destination, seal_ascmhl_destinations
 from ocopy.verified_copy import CopyTreeError, copy_and_seal, copytree
