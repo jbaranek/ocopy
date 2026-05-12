@@ -530,6 +530,7 @@ class CopyJob(Thread):
         self.todo_size = self.total_size * (2 if self.verify else 1)
         self.total_done = 0.0
         self.current_item = None
+        self.current_phase: str = "copy"
         self.finished = False
         self._start_time = time.time()
 
@@ -573,9 +574,11 @@ class CopyJob(Thread):
                 name = name.removesuffix(".copy_in_progress")
             self.current_item = name
             if update.phase == ProgressPhase.VERIFY:
+                self.current_phase = "verify"
                 denom = max(1, update.parallel_verify_readers)
                 self.total_done += update.nbytes / denom
             else:
+                self.current_phase = "copy"
                 self.total_done += update.nbytes
 
     @property
@@ -583,10 +586,12 @@ class CopyJob(Thread):
         return round(100 / self.todo_size * self.total_done) if self.todo_size else 100
 
     @property
+    def elapsed(self) -> float:
+        return max(time.time() - self._start_time, 1e-6)
+
+    @property
     def speed(self) -> float:
-        now = time.time()
-        elapsed = max(now - self._start_time, 1e-6)
-        return (self.total_done / 2 if self.verify else self.total_done) / elapsed
+        return (self.total_done / 2 if self.verify else self.total_done) / self.elapsed
 
     @property
     def progress(self) -> Iterator[str | None]:

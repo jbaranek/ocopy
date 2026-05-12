@@ -278,7 +278,9 @@ class _FakeCancelledJob:
         self.skipped_files = 0
         self.errors = []
         self.speed = 1.0
+        self.elapsed = 1.0
         self.current_item = None
+        self.current_phase = "copy"
         self._pct = 0
         self.checkpoint_paths = [Path(d) / Path(source).name / Checkpoint.FILENAME for d in destinations]
 
@@ -313,6 +315,8 @@ def test_cancel_human(tmp_path, mocker):
 
 
 def test_cancel_machine_readable(tmp_path, mocker):
+    import json
+
     src = tmp_path / "src"
     src.mkdir()
     dst1 = tmp_path / "dst1"
@@ -323,19 +327,25 @@ def test_cancel_machine_readable(tmp_path, mocker):
     runner = CliRunner()
     result = runner.invoke(cli, ["--machine-readable", src.as_posix(), dst1.as_posix(), dst2.as_posix()])
     assert result.exit_code == 3
-    lines = result.output.strip().splitlines()
-    summary = lines[-1]
-    assert summary.startswith("{")
-    assert '"status": "cancelled"' in summary
+
+    events = [json.loads(line) for line in result.output.strip().splitlines()]
+    assert events[0]["type"] == "start"
+    assert events[0]["schema_version"] == 1
+    final = events[-1]
+    assert final["type"] == "result"
+    assert final["status"] == "cancelled"
+    assert final["files_verified"] == 3
     # Multi-destination runs surface an array under ``checkpoints``.
-    assert '"checkpoints"' in summary
-    # Both destination checkpoint paths are reported.
-    assert "dst1" in summary
-    assert "dst2" in summary
+    assert len(final["checkpoints"]) == 2
+    joined = " ".join(final["checkpoints"])
+    assert "dst1" in joined
+    assert "dst2" in joined
 
 
 def test_cancel_end_to_end(tmp_path, mocker):
-    """A real CopyJob cancelled before start must exit 3 with proper JSON output."""
+    """A real CopyJob cancelled before start must exit 3 with a result/cancelled event."""
+    import json
+
     from ocopy.verified_copy import CopyJob as RealCopyJob
 
     src = tmp_path / "src"
@@ -355,12 +365,157 @@ def test_cancel_end_to_end(tmp_path, mocker):
     runner = CliRunner()
     result = runner.invoke(cli, ["--machine-readable", src.as_posix(), dst.as_posix()])
     assert result.exit_code == 3
-    summary = result.output.strip().splitlines()[-1]
-    assert '"status": "cancelled"' in summary
-    assert '"files_verified": 0' in summary
-    assert '"checkpoints"' in summary
+    events = [json.loads(line) for line in result.output.strip().splitlines()]
+    final = events[-1]
+    assert final["type"] == "result"
+    assert final["status"] == "cancelled"
+    assert final["files_verified"] == 0
+    assert isinstance(final["checkpoints"], list)
     assert (dst / "src" / ".ocopy-checkpoint").is_file()
     assert not (dst / "src" / "ascmhl").exists()
+
+
+def test_machine_readable_success(card):
+    """Real CopyJob on a real card emits a clean start..progress..result/ok stream."""
+    import json
+
+    src_dir, destinations = card
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--machine-readable", src_dir.as_posix(), *[d.as_posix() for d in destinations]])
+    assert result.exit_code == 0
+
+    lines = result.output.strip().splitlines()
+    events = [json.loads(line) for line in lines]  # every line must be valid JSON
+
+    # Schema invariants
+    for ev in events:
+        assert "type" in ev
+        assert "ts" in ev
+    assert events[0]["type"] == "start"
+    assert events[0]["schema_version"] == 1
+    assert events[0]["hash_algorithm"] == "xxh64"
+    assert events[0]["verify"] is True
+    assert events[0]["total_bytes"] > 0
+    assert len(events[0]["destinations"]) == len(destinations)
+
+    # Exactly one terminal result event
+    results = [ev for ev in events if ev["type"] == "result"]
+    assert len(results) == 1
+    assert results[0] is events[-1]
+    assert events[-1]["status"] == "ok"
+    assert events[-1]["files_copied"] > 0
+    assert events[-1]["bytes_copied"] == events[0]["total_bytes"]
+    assert events[-1]["speed_bytes_per_sec"] > 0
+    assert events[-1]["duration_s"] > 0
+    assert events[-1]["hash_algorithm"] == "xxh64"
+
+    # Progress events carry phase + speed
+    progress_events = [ev for ev in events if ev["type"] == "progress"]
+    assert progress_events, "expected at least one progress event"
+    for ev in progress_events:
+        assert ev["phase"] in {"copy", "verify"}
+        assert ev["speed_bytes_per_sec"] >= 0
+        assert 0 <= ev["percent"] <= 100
+
+
+def test_machine_readable_insufficient_space(tmp_path, mocker):
+    """Free-space failure emits a single result/error event with code insufficient_space, no start."""
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.bin").write_bytes(b"x" * 64)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    mocker.patch("ocopy.cli.ocopy.free_space", return_value=0)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--machine-readable", src.as_posix(), dst.as_posix()])
+    assert result.exit_code == 1
+
+    events = [json.loads(line) for line in result.output.strip().splitlines()]
+    assert not any(ev["type"] == "start" for ev in events)
+    assert len(events) == 1
+    assert events[0]["type"] == "result"
+    assert events[0]["status"] == "error"
+    assert events[0]["code"] == "insufficient_space"
+    assert events[0]["errors"][0]["available_bytes"] == 0
+
+
+def test_machine_readable_same_drive_warning(tmp_path, mocker):
+    """Two destinations resolving to the same mount produce a same_drive warning between start and result."""
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.bin").write_bytes(b"hello")
+    dst1 = tmp_path / "dst1"
+    dst1.mkdir()
+    dst2 = tmp_path / "dst2"
+    dst2.mkdir()
+
+    mocker.patch("ocopy.cli.ocopy.get_mount", return_value="/")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--machine-readable", src.as_posix(), dst1.as_posix(), dst2.as_posix()])
+    assert result.exit_code == 0
+
+    events = [json.loads(line) for line in result.output.strip().splitlines()]
+    warnings = [ev for ev in events if ev["type"] == "warning" and ev["code"] == "same_drive"]
+    assert len(warnings) == 1
+    assert events[0]["type"] == "start"
+    assert events[-1]["type"] == "result"
+
+
+def test_machine_readable_error_path(card, mocker):
+    """A copy failure surfaces as result/error with the errors array populated."""
+    import json
+    from contextlib import contextmanager
+
+    class FakeIo:
+        def __init__(self, file_path):
+            self._file_path = file_path
+            self._data = BytesIO(b"some fake data")
+
+        def read(self, count):
+            return self._data.read(count)
+
+        def write(self, data):
+            if "dst_3/src/A001XXXX/A001C001_XXXX_XXXX.mov.copy_in_progress" in Path(self._file_path).as_posix():
+                sleep(0.2)
+                raise OSError("IO Error")
+            return len(data)
+
+    @contextmanager
+    def fake_open(path, options, **kwds):
+        yield FakeIo(path)
+
+    def fake_folder_size(*args):
+        return 8 * len("some fake data")
+
+    mocker.patch("builtins.open", fake_open)
+    mocker.patch("ocopy.utils.folder_size", fake_folder_size)
+    mocker.patch("ocopy.verified_copy.copystat", mocker.Mock())
+    mocker.patch("pathlib.Path.rename", mocker.Mock())
+    mocker.patch("pathlib.Path.unlink", autospec=True, side_effect=lambda self, missing_ok=False: None)
+
+    src_dir, destinations = card
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--machine-readable", src_dir.as_posix(), *[d.as_posix() for d in destinations]])
+    assert result.exit_code == 1
+
+    events = [json.loads(line) for line in result.output.strip().splitlines()]
+    assert events[0]["type"] == "start"
+    final = events[-1]
+    assert final["type"] == "result"
+    assert final["status"] == "error"
+    assert final["code"] == "copy_failed"
+    assert len(final["errors"]) > 0
+    assert "source" in final["errors"][0]
+    assert "message" in final["errors"][0]
 
 
 def test_update(card):

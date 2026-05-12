@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import json
 import sys
 import time
 from pathlib import Path
@@ -7,31 +6,12 @@ from pathlib import Path
 import click
 
 from ocopy.backup_check import get_missing
+from ocopy.cli.jsonl_emitter import JSONLEmitter
 from ocopy.cli.update import Updater, suggested_update_command
 from ocopy.hash import DEFAULT_ALGORITHM, SUPPORTED_ALGORITHMS
 from ocopy.sleep_inhibit import sleep_inhibit_best_effort
 from ocopy.utils import folder_size, free_space, get_mount
 from ocopy.verified_copy import CopyJob
-
-
-def _report_cancelled(job: CopyJob, machine_readable: bool) -> None:
-    """Print the cancel summary (human or JSON) that the CLI exits on.
-
-    Reads ``job.checkpoint_paths`` rather than recomputing from CLI arguments so
-    multi-destination runs list every checkpoint and the source of truth stays
-    inside ``CopyJob``.
-    """
-    checkpoints = [str(p.resolve()) for p in job.checkpoint_paths]
-    verified = job.verified_files_count
-    if machine_readable:
-        click.echo(json.dumps({"status": "cancelled", "files_verified": verified, "checkpoints": checkpoints}))
-        return
-    click.secho(
-        f"\nCancelled. {verified} file(s) verified so far; re-run ocopy to resume.",
-        fg="yellow",
-    )
-    for cp in checkpoints:
-        click.secho(f"Checkpoint: {cp}", fg="yellow")
 
 
 @click.command()
@@ -63,7 +43,10 @@ def _report_cancelled(job: CopyJob, machine_readable: bool) -> None:
 )
 @click.option(
     "--machine-readable/--human-readable",
-    help="Output machine-readable progress (defaults to --human-readable)",
+    help=(
+        "Emit a JSON Lines (JSONL) event stream on stdout instead of the human progress bar. "
+        "See docs/machine-readable.md for the event reference. Defaults to --human-readable."
+    ),
     default=False,
 )
 @click.option(
@@ -110,26 +93,64 @@ def cli(
             raise click.UsageError("--legacy-mhl only supports --hash-algorithm xxh64")
         mhl = True
 
+    emitter: JSONLEmitter | None = JSONLEmitter() if machine_readable else None
     updater = Updater()
+
+    source_path = Path(source)
+    destination_paths = [Path(d) for d in destinations]
 
     size = folder_size(source)
     for destination in destinations:
         free = free_space(destination)
         if free < size:
-            click.secho(
-                f"{destination} does not have enough free space (need {size} bytes, have {free} bytes).",
-                fg="red",
-            )
+            if emitter:
+                emitter.result_error(
+                    code="insufficient_space",
+                    errors=[
+                        {
+                            "destination": str(Path(destination).resolve()),
+                            "needed_bytes": size,
+                            "available_bytes": free,
+                            "message": f"{destination} does not have enough free space.",
+                        }
+                    ],
+                )
+            else:
+                click.secho(
+                    f"{destination} does not have enough free space (need {size} bytes, have {free} bytes).",
+                    fg="red",
+                )
             sys.exit(1)
-    click.secho(f"Copying {source} to {', '.join(destinations)}", fg="green")
 
-    destination_paths = [Path(d) for d in destinations]
+    if emitter:
+        emitter.start(
+            source=source_path,
+            destinations=destination_paths,
+            hash_algorithm=hash_algorithm,
+            verify=verify,
+            skip_existing=skip_existing,
+            mhl=mhl,
+            legacy_mhl=legacy_mhl,
+            total_bytes=size,
+        )
+    else:
+        click.secho(f"Copying {source} to {', '.join(destinations)}", fg="green")
+
     if len(destination_paths) != len({get_mount(d) for d in destination_paths}):
-        click.secho("Destinations should all be on different drives.", fg="yellow")
+        if emitter:
+            emitter.warning(code="same_drive", message="Destinations should all be on different drives.")
+        else:
+            click.secho("Destinations should all be on different drives.", fg="yellow")
 
-    with sleep_inhibit_best_effort(warn=lambda msg: click.secho(msg, fg="yellow")):
+    def _sleep_inhibit_warn(msg: str) -> None:
+        if emitter:
+            emitter.warning(code="sleep_inhibit_unavailable", message=msg)
+        else:
+            click.secho(msg, fg="yellow")
+
+    with sleep_inhibit_best_effort(warn=_sleep_inhibit_warn):
         job = CopyJob(
-            Path(source),
+            source_path,
             destination_paths,
             overwrite=overwrite,
             verify=verify,
@@ -138,11 +159,20 @@ def cli(
             legacy_mhl=legacy_mhl,
             algorithm=hash_algorithm,
         )
-        if machine_readable:
+        if emitter:
             for _ in job.progress:
-                click.echo(job.percent_done)
+                emitter.progress(
+                    percent=job.percent_done,
+                    phase=job.current_phase,
+                    current_file=job.current_item,
+                    speed_bytes_per_sec=job.speed,
+                )
         else:
-            with click.progressbar(job.progress, length=100, item_show_func=lambda name: name) as progress:
+            with click.progressbar(
+                job.progress,
+                length=100,
+                item_show_func=lambda name: f"{name or ''} — {job.speed / 1_000_000:.1f} MB/s",
+            ) as progress:
                 for _ in progress:
                     pass
 
@@ -151,54 +181,129 @@ def cli(
             # TODO: break loop if this takes too long
 
         if job.interrupted_by_cancel:
-            _report_cancelled(job, machine_readable)
+            if emitter:
+                emitter.result_cancelled(
+                    files_verified=job.verified_files_count,
+                    checkpoints=job.checkpoint_paths,
+                )
+            else:
+                click.secho(
+                    f"\nCancelled. {job.verified_files_count} file(s) verified so far; re-run ocopy to resume.",
+                    fg="yellow",
+                )
+                for cp in job.checkpoint_paths:
+                    click.secho(f"Checkpoint: {cp.resolve()}", fg="yellow")
             sys.exit(3)
 
         # TODO: check all destinations in parallel
         for destination in destination_paths:
-            missing, _ = get_missing(source, str(destination / Path(source).name))
+            missing, _ = get_missing(source, str(destination / source_path.name))
             if missing:
-                missing_list = "\n".join(missing)
-                click.secho(
-                    f"\n{len(missing)} file{'s' if len(missing) > 1 else ''} missing on {destination}:\n{missing_list}",
-                    fg="red",
-                )
-                click.secho(
-                    "This should not happen! Please contact info@ottomatic.io with as much details as possible.",
-                    fg="red",
-                )
+                if emitter:
+                    emitter.warning(
+                        code="missing_files",
+                        message=(
+                            f"{len(missing)} file{'s' if len(missing) > 1 else ''} missing on {destination}. "
+                            "This should not happen! Please contact info@ottomatic.io."
+                        ),
+                        destination=str(destination.resolve()),
+                        paths=list(missing),
+                    )
+                else:
+                    missing_list = "\n".join(missing)
+                    click.secho(
+                        f"\n{len(missing)} file{'s' if len(missing) > 1 else ''} missing on "
+                        f"{destination}:\n{missing_list}",
+                        fg="red",
+                    )
+                    click.secho(
+                        "This should not happen! Please contact info@ottomatic.io with as much details as possible.",
+                        fg="red",
+                    )
 
-            in_progress_files = list((destination / Path(source).name).glob("**/*copy_in_progress*"))
-            if len(in_progress_files):
-                in_progress_list = "\n".join([f.as_posix() for f in in_progress_files])
-                click.secho(
-                    f"\n{len(in_progress_files)} file{'s' if len(in_progress_files) > 1 else ''} in progress on "
-                    f"{destination}:\n{in_progress_list}",
-                    fg="red",
-                )
-                click.secho(
-                    "This should not happen! Please contact info@ottomatic.io with as much details as possible.",
-                    fg="red",
-                )
-
-        click.echo(f"\n{job.speed / 1000 / 1000:.2f} MB/s")
-
-        if job.skipped_files:
-            click.secho(
-                f"\nSkipped {job.skipped_files} existing file{'s' if job.skipped_files > 1 else ''} "
-                f"with same name, size and modification time.",
-                fg="yellow",
-            )
+            in_progress_files = list((destination / source_path.name).glob("**/*copy_in_progress*"))
+            if in_progress_files:
+                if emitter:
+                    emitter.warning(
+                        code="in_progress_leftover",
+                        message=(
+                            f"{len(in_progress_files)} file{'s' if len(in_progress_files) > 1 else ''} "
+                            f"in progress on {destination}. This should not happen! "
+                            "Please contact info@ottomatic.io."
+                        ),
+                        destination=str(destination.resolve()),
+                        paths=[f.as_posix() for f in in_progress_files],
+                    )
+                else:
+                    in_progress_list = "\n".join([f.as_posix() for f in in_progress_files])
+                    click.secho(
+                        f"\n{len(in_progress_files)} file{'s' if len(in_progress_files) > 1 else ''} in progress on "
+                        f"{destination}:\n{in_progress_list}",
+                        fg="red",
+                    )
+                    click.secho(
+                        "This should not happen! Please contact info@ottomatic.io with as much details as possible.",
+                        fg="red",
+                    )
 
         if job.errors:
-            for error in job.errors:
-                click.secho(f"\nFailed to copy {error.source.name}:\n{error.error_message}", fg="red")
-
+            if emitter:
+                emitter.result_error(
+                    code="copy_failed",
+                    errors=[
+                        {
+                            "source": str(err.source),
+                            "destinations": [str(d) for d in err.destinations],
+                            "message": err.error_message,
+                        }
+                        for err in job.errors
+                    ],
+                    files_copied=job.verified_files_count,
+                    files_skipped=job.skipped_files,
+                )
+            else:
+                click.echo(f"\n{job.speed / 1000 / 1000:.2f} MB/s")
+                if job.skipped_files:
+                    click.secho(
+                        f"\nSkipped {job.skipped_files} existing file{'s' if job.skipped_files > 1 else ''} "
+                        f"with same name, size and modification time.",
+                        fg="yellow",
+                    )
+                for error in job.errors:
+                    click.secho(f"\nFailed to copy {error.source.name}:\n{error.error_message}", fg="red")
             sys.exit(1)
 
         if updater.needs_update:
             cmd = suggested_update_command()
-            click.secho(f"Please update to the latest o/COPY version using `{cmd}`.", fg="blue")
+            if emitter:
+                emitter.warning(
+                    code="update_available",
+                    message=f"Please update to the latest o/COPY version using `{cmd}`.",
+                    command=cmd,
+                )
+            # The human-readable update notice fires after the speed/skipped lines below.
+
+        if emitter:
+            emitter.result_ok(
+                files_copied=job.verified_files_count,
+                files_skipped=job.skipped_files,
+                bytes_copied=size,
+                duration_s=job.elapsed,
+                speed_bytes_per_sec=job.speed,
+                destinations=destination_paths,
+                hash_algorithm=hash_algorithm,
+            )
+        else:
+            click.echo(f"\n{job.speed / 1000 / 1000:.2f} MB/s")
+            if job.skipped_files:
+                click.secho(
+                    f"\nSkipped {job.skipped_files} existing file{'s' if job.skipped_files > 1 else ''} "
+                    f"with same name, size and modification time.",
+                    fg="yellow",
+                )
+            if updater.needs_update:
+                cmd = suggested_update_command()
+                click.secho(f"Please update to the latest o/COPY version using `{cmd}`.", fg="blue")
 
         job.join(timeout=1)
     updater.join(timeout=1)

@@ -63,6 +63,10 @@ Run `ocopy --help` for the full flag list. The introduction above describes skip
 
 During a long run the CLI tries to keep the system from going to idle sleep; that is best-effort and may not work in headless setups, and o/COPY will warn and continue copying.
 
+### Machine-readable output
+
+`--machine-readable` makes `ocopy` emit a [JSON Lines (JSONL) event stream](docs/machine-readable.md) on stdout (one JSON object per line) instead of a human progress bar. Use it from scripts and CI to track progress, capture warnings, and read a structured final result. See [docs/machine-readable.md](docs/machine-readable.md) for the full event reference and schema version.
+
 ### Python
 
 ```python
